@@ -52,14 +52,24 @@ nats pub test.hello "Hello from Silent NATS"
 nats sub test.>
 ```
 
+使用队列分组，多个订阅者会在同一队列内进行负载均衡：
+
+```bash
+nats sub --queue workers test.>
+```
+
 以上示例演示了基础的发布/订阅功能及通配符支持。
 
 ## 测试与压测
 
-可以使用自定义的 Rust 或 Shell 脚本进行发布与订阅的吞吐量和延迟测试。此外，也可利用 [`nats-bench`](https://github.com/nats-io/nats-bench) 等工具针对本服务器实现进行性能评测。
+可以使用自定义的 Rust 或 Shell 脚本进行发布与订阅的吞吐量和延迟测试。此外，也可以使用官方 [`nats cli`](https://github.com/nats-io/natscli) 的 `bench` 命令对本服务器进行性能评测，例如：
+
+```bash
+nats bench test --pub 10 --sub 2 --msgs 100000
+```
 
 ## 当前功能与路线图
 
 - ✅ 基础协议支持：`INFO`、`CONNECT`、`PING/PONG`、`SUB/UNSUB`、`PUB`、`MSG`
-- 🚧 队列分组支持（开发中）
+- ✅ 队列分组支持：同一队列名称的订阅者按轮询顺序接收消息
 - ❌ JetStream 及高级 NATS 功能（未来规划）

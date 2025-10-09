@@ -82,7 +82,13 @@ async fn handle_command(
     match command {
         ClientCommand::Connect(payload) => {
             info!(client_id = %client_id, ?payload, "客户端 CONNECT");
-            sender.send(ServerMessage::Ok).await?;
+            let verbose = payload
+                .get("verbose")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if verbose {
+                sender.send(ServerMessage::Ok).await?;
+            }
         }
         ClientCommand::Ping => {
             sender.send(ServerMessage::Pong).await?;

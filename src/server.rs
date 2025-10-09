@@ -35,6 +35,29 @@ pub struct SubscriptionEntry {
     pub sender: mpsc::Sender<ServerMessage>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct QueueKey {
+    subject: String,
+    queue: String,
+}
+
+impl QueueKey {
+    fn new(subject: &Subject, queue: &str) -> Self {
+        Self {
+            subject: subject.raw().to_string(),
+            queue: queue.to_string(),
+        }
+    }
+
+    fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    fn queue(&self) -> &str {
+        &self.queue
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ServerError {
     #[error("客户端不存在: {0}")]
@@ -67,7 +90,7 @@ pub struct ServerState {
     server_id: String,
     clients: RwLock<HashMap<String, ClientHandle>>,
     subscriptions: RwLock<HashMap<SubscriptionKey, SubscriptionEntry>>,
-    queue_counters: Mutex<HashMap<String, usize>>,
+    queue_counters: Mutex<HashMap<QueueKey, usize>>,
 }
 
 impl ServerState {
@@ -103,8 +126,23 @@ impl ServerState {
             let mut clients = self.clients.write().await;
             clients.remove(client_id);
         }
-        let mut subscriptions = self.subscriptions.write().await;
-        subscriptions.retain(|key, _| key.client_id != client_id);
+        let mut removed_queues = Vec::new();
+        {
+            let mut subscriptions = self.subscriptions.write().await;
+            subscriptions.retain(|key, entry| {
+                if key.client_id == client_id {
+                    if let Some(queue) = entry.queue_group.as_ref() {
+                        removed_queues.push(QueueKey::new(&entry.subject, queue));
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        for queue_key in removed_queues {
+            self.prune_queue_key(&queue_key).await;
+        }
     }
 
     pub async fn add_subscription(
@@ -156,8 +194,18 @@ impl ServerState {
 
     pub async fn remove_subscription(&self, client_id: &str, sid: &str) -> Result<(), ServerError> {
         let key = SubscriptionKey::new(client_id.to_string(), sid.to_string());
-        let mut subscriptions = self.subscriptions.write().await;
-        if subscriptions.remove(&key).is_some() {
+        let removed = {
+            let mut subscriptions = self.subscriptions.write().await;
+            subscriptions.remove(&key)
+        };
+        if let Some(entry) = removed {
+            let queue_key = entry
+                .queue_group
+                .as_ref()
+                .map(|queue| QueueKey::new(&entry.subject, queue));
+            if let Some(queue_key) = queue_key {
+                self.prune_queue_key(&queue_key).await;
+            }
             Ok(())
         } else {
             Err(ServerError::SubscriptionNotFound(key))
@@ -188,61 +236,130 @@ impl ServerState {
         if matches.is_empty() {
             return Ok(());
         }
+        let reply_ref = reply_to.as_ref();
         let mut direct = Vec::new();
-        let mut grouped: HashMap<String, Vec<(SubscriptionKey, SubscriptionEntry)>> =
+        let mut grouped: HashMap<QueueKey, Vec<(SubscriptionKey, SubscriptionEntry)>> =
             HashMap::new();
         for (key, entry) in matches {
             if let Some(queue) = entry.queue_group.clone() {
-                let queue_key = format!("{}:{}", entry.subject.raw(), queue);
+                let queue_key = QueueKey::new(&entry.subject, &queue);
                 grouped.entry(queue_key).or_default().push((key, entry));
             } else {
                 direct.push((key, entry));
             }
         }
-        let mut deliveries = Vec::new();
-        deliveries.extend(direct);
-        for (queue_key, mut entries) in grouped {
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            let len = entries.len();
-            let index = {
-                let mut counters = self.queue_counters.lock().await;
-                let cursor = counters.entry(queue_key).or_insert(0);
-                let chosen = *cursor % len;
-                *cursor = (*cursor + 1) % len;
-                chosen
-            };
-            if let Some((key, entry)) = entries.into_iter().nth(index) {
-                deliveries.push((key, entry));
-            }
+        for (key, entry) in direct {
+            self.dispatch_subscription(key, entry, subject, reply_ref, payload.as_slice())
+                .await;
         }
-        for (key, entry) in deliveries {
-            let message = OutboundMessage {
-                subject: subject.to_string(),
-                sid: key.sid.clone(),
-                reply_to: reply_to.clone(),
-                payload: payload.clone(),
-            };
-            if entry
-                .sender
-                .send(ServerMessage::Msg(message))
-                .await
-                .is_err()
-            {
-                error!(client_id = %key.client_id, sid = %key.sid, "发送消息失败，移除客户端");
-                self.unregister_client(&key.client_id).await;
-                continue;
-            }
-            let mut subscriptions = self.subscriptions.write().await;
-            if let Some(target) = subscriptions.get_mut(&key) {
-                target.delivered = target.delivered.saturating_add(1);
-                if let Some(max) = target.max_msgs
-                    && target.delivered >= max
-                {
-                    debug!(client_id = %key.client_id, sid = %key.sid, "达到最大消息数，自动取消订阅");
-                    subscriptions.remove(&key);
-                }
-            }
+        for (queue_key, entries) in grouped {
+            self.dispatch_queue_group(queue_key, entries, subject, reply_ref, payload.as_slice())
+                .await;
         }
         Ok(())
+    }
+
+    async fn dispatch_subscription(
+        &self,
+        key: SubscriptionKey,
+        entry: SubscriptionEntry,
+        subject: &str,
+        reply_to: Option<&String>,
+        payload: &[u8],
+    ) -> bool {
+        let message = OutboundMessage {
+            subject: subject.to_string(),
+            sid: key.sid.clone(),
+            reply_to: reply_to.cloned(),
+            payload: payload.to_vec(),
+        };
+        match entry.sender.send(ServerMessage::Msg(message)).await {
+            Ok(()) => {
+                let mut queue_key = None;
+                {
+                    let mut subscriptions = self.subscriptions.write().await;
+                    if let Some(target) = subscriptions.get_mut(&key) {
+                        target.delivered = target.delivered.saturating_add(1);
+                        if let Some(max) = target.max_msgs
+                            && target.delivered >= max
+                        {
+                            debug!(
+                                client_id = %key.client_id,
+                                sid = %key.sid,
+                                "达到最大消息数，自动取消订阅"
+                            );
+                            queue_key = target
+                                .queue_group
+                                .as_ref()
+                                .map(|queue| QueueKey::new(&target.subject, queue));
+                            subscriptions.remove(&key);
+                        }
+                    }
+                }
+                if let Some(queue_key) = queue_key {
+                    self.prune_queue_key(&queue_key).await;
+                }
+                true
+            }
+            Err(_) => {
+                error!(client_id = %key.client_id, sid = %key.sid, "发送消息失败，移除客户端");
+                self.unregister_client(&key.client_id).await;
+                false
+            }
+        }
+    }
+
+    async fn dispatch_queue_group(
+        &self,
+        queue_key: QueueKey,
+        mut entries: Vec<(SubscriptionKey, SubscriptionEntry)>,
+        subject: &str,
+        reply_to: Option<&String>,
+        payload: &[u8],
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let len = entries.len();
+        let start_index = {
+            let mut counters = self.queue_counters.lock().await;
+            let cursor = counters.entry(queue_key.clone()).or_insert(0);
+            *cursor % len
+        };
+        let mut selected_index = None;
+        for attempt in 0..len {
+            let idx = (start_index + attempt) % len;
+            let (key, entry) = entries[idx].clone();
+            if self
+                .dispatch_subscription(key, entry, subject, reply_to, payload)
+                .await
+            {
+                selected_index = Some(idx);
+                break;
+            }
+        }
+        {
+            let mut counters = self.queue_counters.lock().await;
+            if let Some(success_idx) = selected_index {
+                counters.insert(queue_key.clone(), (success_idx + 1) % len);
+            } else {
+                counters.remove(&queue_key);
+            }
+        }
+        self.prune_queue_key(&queue_key).await;
+    }
+
+    async fn prune_queue_key(&self, queue_key: &QueueKey) {
+        let subscriptions = self.subscriptions.read().await;
+        let exists = subscriptions.values().any(|entry| {
+            entry.queue_group.as_deref() == Some(queue_key.queue())
+                && entry.subject.raw() == queue_key.subject()
+        });
+        drop(subscriptions);
+        if !exists {
+            let mut counters = self.queue_counters.lock().await;
+            counters.remove(queue_key);
+        }
     }
 }
